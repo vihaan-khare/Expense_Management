@@ -1,0 +1,237 @@
+**EXPENSEFLOW — MASTER BUILD PROMPT**
+
+You are building ExpenseFlow, a production-grade enterprise expense reimbursement management system. Two files are attached: the official problem statement (use this as the source of truth for all features and requirements) and `ui_base44.txt` (use this for UI inspiration only — take the layout ideas and visual structure but implement everything cleanly from scratch, do not copy-paste any code or logic from it).
+
+---
+
+**PRODUCT OVERVIEW**
+
+ExpenseFlow solves the core problem of manual, opaque, error-prone expense reimbursement at companies. The system supports multi-role access (Admin, Manager, Employee), flexible multi-level approval workflows with conditional rules, real-time currency conversion, OCR receipt scanning via Claude API, and a threaded discussion system on every expense. Every feature must feel production-ready — not a demo or prototype.
+
+---
+
+**TECH & ARCHITECTURE DECISIONS**
+
+Use a clean separation between UI and logic. The database is the single source of truth. All state lives in the database — never in local component state for anything that needs to persist. All API calls (currency conversion, OCR, invite emails) happen server-side, never exposed directly from the frontend.
+
+Database tables required (use exactly these names and field names — consistency between frontend and backend is non-negotiable):
+
+`companies` — id, name, country, currency_code, created_at
+
+`users` — id, company_id (FK), name, email, password_hash, role (enum: admin | manager | employee), direct_manager_id (self-referential FK, nullable), is_manager_approver (boolean, default false), invite_status (enum: pending | active), invite_token (nullable), invite_expires_at (nullable), created_at
+
+`expenses` — id, company_id (FK), employee_id (FK → users), amount, currency, converted_amount, category, description, expense_date, receipt_url (nullable), ocr_autofilled (boolean, default false), status (enum: draft | submitted | pending_manager | in_review | changes_requested | approved | rejected | appealed), current_step (integer, default 0), total_steps (integer), auto_approved (boolean, default false), auto_approve_reason (nullable string), revision_count (integer, default 0), max_revisions (integer, default 3), created_at, updated_at
+
+`approval_chains` — id, company_id (FK), name, mode (enum: sequential | conditional | hybrid), is_active (boolean), created_at
+
+`chain_steps` — id, chain_id (FK), step_number (integer), role_label (string), assigned_user_id (FK → users, nullable — null means "any manager"), created_at
+
+`conditional_rules` — id, chain_id (FK), rule_type (enum: percentage | specific | hybrid), percentage_threshold (integer, nullable), key_approver_id (FK → users, nullable), created_at
+
+`approval_actions` — id, expense_id (FK), approver_id (FK → users), step_number (integer), action (enum: approved | changes_requested | rejected), justification (string, minimum 20 characters enforced), change_reasons (JSON array, nullable — used when action is changes_requested), created_at
+
+`expense_comments` — id, expense_id (FK), user_id (FK), comment_type (enum: submission | approval | rejection | changes_requested | query | reply | revision_submitted | admin_override), content (text), attachment_url (nullable), is_visible_to_employee (boolean, default true), created_at
+
+`appeals` — id, expense_id (FK), submitted_by (FK → users), reason (text, minimum 50 characters), evidence_url (nullable), reviewed_by (FK → users, nullable), admin_decision (enum: approved | rejected, nullable), admin_justification (nullable text), created_at, reviewed_at (nullable)
+
+---
+
+**AUTHENTICATION & ONBOARDING FLOW**
+
+Signup creates a new company and the first admin user atomically — both records must be created in the same transaction or neither should be created. On the signup form, the user selects their country from a dropdown populated by the REST Countries API (`https://restcountries.com/v3.1/all?fields=name,currencies`). The selected country's primary currency is stored as `currency_code` on the company — this becomes the company's base currency for all conversions and manager-facing displays.
+
+After signup, the admin is taken directly to their dashboard. There is no email verification for the admin — they are active immediately.
+
+For all other users: the admin creates them via the "Add member" form (name, email, role, direct manager assignment). The system generates a secure random invite token, stores it with a 48-hour expiry, and sends an invite email containing a unique signup link. The invited user clicks the link, is shown a simple "set your password" form (name is pre-filled from what admin entered, email is read-only), and on submission their `invite_status` changes from `pending` to `active`. Expired invite tokens should show a clear error with an option to request a new invite. Users cannot self-register into an existing organisation — the only entry point is an admin invite.
+
+Session management: use JWT tokens stored in httpOnly cookies. The JWT payload must include `user_id`, `company_id`, and `role`. Every protected route checks this token server-side before returning any data.
+
+---
+
+**ROLE SYSTEM & PERMISSIONS**
+
+Three roles with strictly enforced permissions:
+
+Admin — can do everything: create/edit/deactivate users, change user roles, configure approval chains and conditional rules, view all expenses across the company, override any approval, view all discussion threads, access the appeals queue, see company-wide analytics.
+
+Manager — can view expenses assigned to them for approval (based on chain step or direct manager relationship), approve/request changes/reject those expenses, view the full discussion thread on expenses they are involved with, view their direct reports' expense history.
+
+Employee — can submit new expenses, view only their own expense history, view the full discussion thread on their own expenses, respond to change requests, submit appeals on hard-rejected expenses. Cannot see any other employee's expenses.
+
+Every API endpoint must enforce these permissions server-side. Frontend role checks are for UX only — never trust the frontend for access control.
+
+---
+
+**EXPENSE SUBMISSION**
+
+The submission form collects: amount (number), currency (dropdown of all world currencies — default to company currency but allow any), category (dropdown: Travel | Meals | Accommodation | Equipment | Software | Training | Marketing | Other), description (text, required, minimum 10 characters), expense date (date picker, cannot be future date), and receipt (optional file upload, accept jpg/png/pdf, max 5MB).
+
+Currency conversion: when the employee selects a currency different from the company currency, call the exchange rate API (`https://api.exchangerate-api.com/v4/latest/{BASE_CURRENCY}`) and show the converted amount in real-time as they type. Store both the original amount+currency and the converted amount in the database. Managers always see amounts in the company's base currency.
+
+On submission, the expense status changes from `draft` to either `pending_manager` (if the employee has `is_manager_approver = true` and a direct manager assigned) or `in_review` (goes straight to step 1 of the approval chain). A `submission` comment is automatically created in the discussion thread containing the employee's description as the content.
+
+OCR receipt scanning: when the employee uploads a receipt image, offer a "Scan receipt" button. On click, send the image as base64 to the Claude API (`claude-sonnet-4-20250514` model) with a prompt instructing it to extract: merchant name, total amount, currency, date, and a suggested category. Auto-populate the matching form fields with the extracted values and set `ocr_autofilled = true`. Show each auto-filled field with a subtle highlight so the employee knows it was auto-detected. The employee must review and can edit any field before submitting — OCR is a suggestion, not a final value.
+
+---
+
+**APPROVAL WORKFLOW — THE CORE ENGINE**
+
+This is the most critical and complex part of the system. It must be implemented as a proper state machine, not ad-hoc conditional logic.
+
+Two systems run simultaneously: the Sequential Chain and the Conditional Rules evaluator. After every approval action, both are evaluated.
+
+Sequential Chain: the admin configures an ordered list of steps. Each step has a `role_label` (e.g. "Manager", "Finance", "Director") and optionally an `assigned_user_id`. If `assigned_user_id` is null, any user with the manager role can fulfil that step. The expense moves to step N+1 only after step N is approved. If anyone rejects at any step, the chain stops immediately and the expense is marked `rejected`. The number of steps is stored as `total_steps` on the expense at submission time.
+
+Manager pre-step: if the employee's `is_manager_approver` flag is true and they have a `direct_manager_id` assigned, the expense goes to that manager first as step 0 before the sequential chain begins. This is tracked as an `approval_action` with `step_number = 0`. If the manager rejects at step 0, the expense is rejected and the chain never starts. If the manager approves, the expense moves to step 1 of the configured chain. Important: if the same manager is also step 1 of the chain, they will receive two separate approval requests — this is allowed and intentional.
+
+Conditional rules evaluator — runs after every approval action (including step 0):
+
+Percentage rule: count the number of approved `approval_actions` for this expense divided by `total_steps`. If this ratio is greater than or equal to the configured `percentage_threshold` (stored as an integer, e.g. 60 means 60%), auto-approve the expense immediately. Set `auto_approved = true` and `auto_approve_reason = "Percentage threshold (X%) met — Y/Z approvers"`. Remaining steps are skipped.
+
+Specific approver rule: check if the `approver_id` of the action that just occurred matches the `key_approver_id` in the conditional rule. If yes, auto-approve immediately. Set `auto_approved = true` and `auto_approve_reason = "Key approver approved"`.
+
+Hybrid rule: evaluate both the percentage rule and the specific approver rule. If either condition is true, auto-approve. First condition to trigger wins.
+
+Rejection override: if an action is a rejection, skip the conditional evaluator entirely. Rejection always stops the chain, regardless of what percentage of approvers have previously approved.
+
+When the expense reaches the final step and no conditional rule has triggered, approve normally (no auto-approve flag needed, just set `status = approved`).
+
+On every step transition, create a notification for the next approver in the chain. Notifications at minimum should be visible in the app (a bell icon with unread count in the nav). Email notifications are a nice-to-have if time allows.
+
+---
+
+**3-OPTION APPROVAL ACTION**
+
+When an approver reviews an expense, they have exactly three choices — not two. This is a deliberate product decision:
+
+Approve: final approval for this step. Moves the expense to the next step or triggers conditional evaluation. Requires justification (minimum 20 characters). Reject lazy justifications — if the text is only "ok", "approved", "looks good", "fine", or similar single-word confirmations, show a validation error asking for a meaningful explanation.
+
+Request Changes (soft reject): this is NOT a final rejection. The expense stays at the current step. The approver must select one or more reasons from a predefined checklist (Receipt unclear/missing, Amount justification needed, Wrong category selected, Policy violation, Requires additional information, Other) plus a mandatory free-text explanation (minimum 20 characters). The expense status changes to `changes_requested`. The `revision_count` increments by 1. If `revision_count` reaches `max_revisions` (default 3), the approver cannot request changes again — they must approve or reject.
+
+Hard Reject: permanent rejection. Requires a strong justification (minimum 20 characters). The expense status changes to `rejected`. The chain stops. The employee is notified and can see the rejection reason.
+
+---
+
+**DISCUSSION THREAD**
+
+Every expense has a threaded discussion visible to all involved parties. This is a key differentiating feature — it should feel like a real audit trail, not just a comments section.
+
+Thread entries are created automatically for system events (expense submitted, approved, changes requested, rejected, appeal submitted, admin override) and manually for user comments and queries.
+
+Each thread entry has a visual type indicated by a colored left border and tinted background:
+- Submission: blue
+- Approval: green  
+- Rejection: red
+- Changes requested: orange
+- Query/comment: purple
+- Reply: gray
+- Revision submitted (employee responds to change request): cyan
+- Admin override: emerald
+
+Every approval action (approve, request changes, reject) automatically creates a corresponding thread entry with the justification text as the content. The approver's name, role, and timestamp are always shown.
+
+Visibility rules: the submitting employee sees the full thread on their own expense. Other employees have no access. Managers and approvers in the chain see the full thread on expenses assigned to them. Admin sees all threads on all expenses.
+
+The composer at the bottom of the thread allows any involved party to post a query or reply. Queries are for asking clarifying questions. Replies are for responding. Both are visible to all involved parties.
+
+When the approver selects "Request Changes", the employee receives a notification. The employee can then view the thread, see exactly what was flagged, write a response, optionally upload additional files, and click "Resubmit for review". This creates a `revision_submitted` thread entry and sends the expense back to the same approver at the same step.
+
+---
+
+**APPEAL SYSTEM**
+
+When an expense is hard rejected, the employee sees an "Appeal this decision" button on the expense detail page. They can submit one appeal per expense (enforce this — check `appeals` table before showing the button). The appeal form requires a reason (minimum 50 characters) explaining why the rejection was incorrect, plus optional file evidence upload.
+
+Appeals go directly to the Admin — no one else. The admin sees a dedicated "Appeals" section in their dashboard showing all pending appeals with the full expense history and discussion thread. The admin can either override and approve (setting the expense status to `approved` and creating an `admin_override` thread entry) or uphold the rejection. Both decisions require a justification from the admin.
+
+---
+
+**DESIGN SYSTEM**
+
+The attached `ui_base44.txt` file shows a previous UI attempt — use it for layout inspiration and screen structure ideas only. The actual implementation must follow these precise design tokens:
+
+Brand color: indigo `#4F63F0` (HSL 234 89% 60%) — use for primary buttons, active nav items, focus rings, and key interactive elements.
+
+Page background: `#F3F5F9`. Card/panel background: `#FFFFFF`. Sidebar background: `#FFFFFF` with a right border. Muted fill: `#EEF0F5`. Input border: `#E6E9F0`.
+
+Typography: Sora (weights 600–700) for page titles and the app name. Inter (weights 400–600) for all body text, labels, and UI elements. Import both from Google Fonts.
+
+Border radius: `12px` for cards and panels, `8px` for buttons/inputs/badges, `9999px` for status pills and role chips.
+
+Shadows: `shadow-sm` for standard cards, `shadow-md` on card hover. No heavy drop shadows anywhere.
+
+Status badge colors — each badge is a pill with a colored dot + label:
+- Draft: slate background, slate text
+- Submitted: blue background, blue text  
+- Pending manager: purple background, purple text
+- In review: amber background, amber text
+- Changes requested: orange background, orange text
+- Approved: green background, green text
+- Rejected: red background, red text
+- Appealed: yellow background, yellow-dark text
+
+Three-option action buttons: Approve = solid green. Request Changes = outlined orange. Hard Reject = solid red. These three must always appear together as a group when an approver is reviewing an expense.
+
+Approval workflow step visualizer: a horizontal chain of step dots connected by lines. Completed steps = green filled dot with checkmark. Active step = indigo filled dot. Pending steps = muted gray dot. This visualizer appears at the top of every expense detail page.
+
+Discussion thread messages: each message block has a 4px left border and a lightly tinted background matching the message type (colors listed above in the Discussion Thread section). Messages animate in with a subtle slide-up fade (opacity 0 + translateY 10px → opacity 1 + translateY 0, 300ms ease-out).
+
+Sidebar navigation: fixed width 256px. Logo block at top with app name in Sora bold. Nav links with icon + label. Active link gets indigo background + white text + subtle shadow. Inactive links are muted gray, hover to accent background. User info at the bottom showing name, role pill, and logout.
+
+---
+
+**SCREENS TO BUILD**
+
+1. Signup page — company name, admin name, email, password, country selector (fetches from REST Countries API), submit creates company + admin atomically.
+
+2. Login page — email + password, redirects based on role after auth.
+
+3. Invite acceptance page — pre-filled name and read-only email, password + confirm password, submit activates account.
+
+4. Admin dashboard — KPI cards (total expenses this month, pending approvals, approved this month, rejected this month), recent expenses table, quick links to user management and approval chain config.
+
+5. User management page (admin only) — table of all company users with name, email, role pill, manager assignment, invite status, and actions (edit role, resend invite for pending users, deactivate). "Add member" button opens a form/modal.
+
+6. Approval chain configuration page (admin only) — configure the approval mode (sequential / conditional / hybrid toggle), add/remove/reorder chain steps, configure conditional rules (rule type, threshold percentage, key approver selection).
+
+7. Submit expense page (employee) — the full submission form with currency conversion live preview and OCR scan button.
+
+8. My expenses page (employee) — table/list of own expenses with status badges, amounts (original + converted), category, date, and a link to the detail page.
+
+9. Approver queue page (manager/admin) — list of expenses currently waiting for this user's action. Shows employee name, amount in company currency, category, days waiting, and current step indicator.
+
+10. Expense detail page — the most complex screen. Shows full expense info at the top, the step visualizer, the discussion thread (scrollable, with composer at bottom), and — if this expense is waiting for the current user's action — the 3-option action panel with justification textarea and (for Request Changes) the reasons checklist.
+
+11. Appeals queue page (admin only) — list of pending appeals with employee name, expense amount, rejection reason summary, appeal reason summary, and a "Review" button that opens the full detail with the admin decision form.
+
+12. Notifications panel — accessible from the bell icon in the top nav. Shows unread notifications with type, expense reference, and timestamp. Mark all as read button.
+
+---
+
+**EXTERNAL APIS**
+
+Countries + currencies: `GET https://restcountries.com/v3.1/all?fields=name,currencies` — used on the signup form country selector. Cache this response — it does not change frequently.
+
+Currency conversion: `GET https://api.exchangerate-api.com/v4/latest/{BASE_CURRENCY}` — called when an employee changes the currency on the expense form. Debounce the call by 300ms to avoid excessive requests. Show a loading indicator while fetching.
+
+OCR via Claude API: `POST https://api.anthropic.com/v1/messages` with model `claude-sonnet-4-20250514`. Send the receipt image as a base64-encoded image block. The system prompt should instruct Claude to return a JSON object with keys: `merchant_name`, `amount`, `currency`, `date` (ISO format), `suggested_category`. Parse the JSON response and populate the form fields. Handle failures gracefully — if OCR fails, show a toast notification and leave the form fields empty for manual entry.
+
+---
+
+**CRITICAL IMPLEMENTATION NOTES**
+
+The approval state machine must be transactional. When an approval action is recorded, the following must happen atomically: insert the `approval_actions` record, evaluate conditional rules, update `expenses.status` and `expenses.current_step`, create the thread entry, and generate the next notification. If any part fails, roll back everything. Race conditions (two approvers clicking approve simultaneously) must be handled — use optimistic locking or a database transaction with a status check.
+
+The `is_manager_approver` flag and the sequential chain are independent systems. A manager can appear in both — as the step-0 pre-approver and also as step 1 in the chain. This is intentional and must be supported.
+
+Never expose raw database IDs in URLs if they contain sensitive information — use UUIDs throughout (they are already specified as the ID type for all tables).
+
+All forms must have proper client-side validation with clear error messages before submitting to the server. All server responses must return consistent error shapes so the frontend can display them uniformly.
+
+The discussion thread must update in real-time or near-real-time when new entries are added. At minimum, implement polling every 10 seconds on the expense detail page. WebSockets are ideal if the platform supports it.
+
+Mobile responsiveness is required. The sidebar should collapse to a hamburger menu on screens below 768px. All tables should scroll horizontally on small screens rather than breaking layout.
+
+---
+
+This prompt, combined with the attached problem statement PDF and `ui_base44.txt`, gives you everything needed for a complete, production-quality implementation. Build to this spec exactly.
